@@ -1,12 +1,15 @@
-# Windows MCP.Net
+# Windows MCP.Net - 跨机器远程Windows桌面自动化
 
 [English](README.en.md) | **中文**
 
-一个基于 .NET 的 Windows 桌面自动化 MCP (Model Context Protocol) 服务器，为 AI 助手提供与 Windows 桌面环境交互的能力。
+一个基于 .NET 的 Windows 桌面自动化 MCP (Model Context Protocol) 服务器，**支持跨机器远程控制**，让 AI 助手能够通过网络控制另一台Windows机器的桌面环境。
+
+📍 **核心特色**：AI 在机器 A，想控制机器 B 的Windows桌面？本项目正是为此而生！通过 HTTP 远程模式，你可以让云端/另一台电脑上的 AI 直接控制本地Windows桌面。
 
 ## 📋 目录
 
 - [功能特性](#-功能特性)
+- [运行模式](#-运行模式)
 - [使用场景](#-使用场景)
 - [演示截图](#-演示截图)
 - [技术栈](#️-技术栈)
@@ -28,9 +31,7 @@
 
 ### 1. MCP 客户端配置
 
-在您的 MCP 客户端配置中添加以下配置：
-
-#### 使用全局安装的工具（推荐）
+#### 本地模式（同一机器）
 ```json
 {
     "mcpServers": {
@@ -44,42 +45,20 @@
 }
 ```
 
-#### 使用项目源码直接运行（开发模式）
+#### 远程模式（跨机器控制）
+在**被控Windows机器**上启动：
+```bash
+# 启动 HTTP 远程服务，默认监听 localhost:8888
+dotnet run --project src/Windows-MCP.Net.csproj -- --remote
 
-**方式一：工作区配置**
-
-在项目根目录创建 `.vscode/mcp.json` 文件：
-```json
-{
-  "mcpServers": {
-    "Windows-MCP.Net-Dev": {
-      "type": "stdio",
-      "command": "dotnet",
-      "args": ["run", "--project", "src/Windows-MCP.Net.csproj"],
-      "cwd": "${workspaceFolder}",
-      "env": {}
-    }
-  }
-}
+# 自定义端口和绑定地址
+dotnet run --project src/Windows-MCP.Net.csproj -- --remote --port 8888 --host 0.0.0.0
 ```
 
-**方式二：用户配置**
+在**AI客户端机器**上的 MCP 配置：
+通过 HTTP 转接请求到远程 Windows 机器即可。
 
-通过VS Code命令面板运行 `MCP: Open User Configuration`，添加：
-```json
-{
-  "mcpServers": {
-    "Windows-MCP.Net-Local": {
-      "type": "stdio",
-      "command": "dotnet",
-      "args": ["run", "--project", "src/Windows-MCP.Net.csproj"],
-      "env": {}
-    }
-  }
-}
-```
-
-> **注意**: 使用项目源码方式便于开发调试，修改代码后无需重新安装即可生效。VS Code 1.102+ 版本支持MCP服务器的自动发现和管理。
+> **使用场景**: AI 在云端/VS Code DevContainer/另一台电脑，想控制你本地Windows桌面 - 这正是本项目的强项！
 
 ### 2. 安装和运行
 
@@ -91,14 +70,17 @@ dotnet tool install --global WindowsMCP.Net
 #### 方式二：从源码运行
 ```bash
 # 克隆仓库
-git clone https://github.com/AIDotNet/Windows-MCP.Net.git
-cd Windows-MCP.Net
+git clone https://github.com/hualiandie12315-del/windows-MCP-Remote.git
+cd windows-MCP-Remote
 
 # 构建项目
 dotnet build
 
-# 运行项目
+# 本地模式（stdio）
 dotnet run --project src/Windows-MCP.Net.csproj
+
+# 远程模式（HTTP，支持跨机器控制）
+dotnet run --project src/Windows-MCP.Net.csproj -- --remote
 ```
 
 ### 3. 开始使用
@@ -171,7 +153,7 @@ dotnet run --project src/Windows-MCP.Net.csproj
 | **ExtractTextFromRegionTool** | 使用OCR从屏幕指定区域提取文字 |
 | **FindTextOnScreenTool** | 使用OCR在屏幕上查找指定文字 |
 | **GetTextCoordinatesTool** | 获取屏幕上文字的坐标位置 |
-| **ExtractTextFromFileTool** | 使用OCR从图像文件中提取文字 |
+| **ExtractTextFromFileTool** | 使用OCR从图像文件提取文字 |
 
 ## UI元素识别工具
 
@@ -191,12 +173,25 @@ dotnet run --project src/Windows-MCP.Net.csproj
 | **VolumeTool** | 调节系统音量，支持增减和设置具体百分比 |
 | **ResolutionTool** | 设置屏幕分辨率（高、中、低三档） |
 
+## 🎯 运行模式
+
+### 本地模式 (stdio)
+- AI 和 Windows MCP 运行在同一台机器
+- 通过标准输入输出通信
+- 延迟最低，推荐日常使用
+
+### 远程模式 (HTTP)
+- **AI 运行在机器 A**，**Windows MCP 运行在机器 B**
+- AI 通过 HTTP 请求控制机器 B 的桌面
+- 支持跨网络、跨设备控制
+- **这是本分叉的核心特色** ✨
+
 ## 💡 使用场景
 
-### 🤖 AI助手桌面自动化
-- **智能客服机器人**: AI助手可以自动操作Windows应用程序，帮助用户完成复杂的桌面任务
-- **语音助手集成**: 结合语音识别，通过语音指令控制桌面应用程序
-- **智能办公助手**: AI助手自动处理日常办公任务，如文档整理、邮件发送等
+### 🤖 AI助手跨机器桌面自动化
+- **云端AI控制本地桌面**: AI 在 Claude Code/Cursor 云端，控制你本地Windows做操作
+- **语音助手集成**: 结合语音识别，通过语音指令控制本地桌面应用
+- **智能办公助手**: AI 自动处理日常办公任务，如文档整理、邮件发送
 
 ### 📊 办公自动化
 - **数据录入自动化**: 自动从网页或文档中提取数据并录入到Excel或其他应用程序
@@ -281,13 +276,13 @@ src/
 ├── Windows-MCP.Net/         # 主项目
 │   ├── .mcp/                # MCP 服务器配置
 │   │   └── server.json      # 服务器配置文件
-│   ├── Exceptions/          # 自定义异常类（待扩展）
+│   ├── Exceptions/          # 自定义异常类
 │   ├── Interface/           # 服务接口定义
 │   │   ├── IDesktopService.cs   # 桌面服务接口
 │   │   ├── IFileSystemService.cs # 文件系统服务接口
 │   │   └── IOcrService.cs       # OCR服务接口
-│   ├── Models/              # 数据模型（待扩展）
-│   ├── Prompts/             # 提示模板（待扩展）
+│   ├── Models/              # 数据模型
+│   ├── Prompts/             # 提示模板
 │   ├── Services/            # 核心服务实现
 │   │   ├── DesktopService.cs    # 桌面操作服务
 │   │   ├── FileSystemService.cs # 文件系统服务
@@ -356,132 +351,4 @@ src/
 - **文件监控**: 实时监控文件系统变化
 
 #### 系统监控与性能分析
-- **系统资源监控**: CPU、内存、磁盘、网络使用情况
-- **进程管理**: 进程列表获取、性能监控、进程控制
-- **性能分析报告**: 生成详细的系统性能报告
-
-#### 多媒体处理能力
-- **音频控制**: 系统音量控制、音频设备管理
-- **图像处理**: 图片缩放、裁剪、格式转换
-- **屏幕录制**: 支持屏幕录制和回放
-
-#### 网络与通信功能
-- **网络诊断**: Ping、端口扫描、连通性测试
-- **HTTP客户端**: 支持RESTful API调用
-- **WiFi管理**: WiFi网络扫描和连接管理
-
-#### 安全性与权限管理
-- **权限检查**: 用户权限验证和管理
-- **数据加密**: 敏感数据加密存储
-- **操作审计**: 完整的操作日志和审计追踪
-
-### 开发路线图
-
-#### 第一阶段（高优先级）- 核心功能增强
-- ✅ UI元素识别工具（已完成Windows API实现）
-- 🔄 文件管理工具增强
-- 📋 系统监控工具
-- 🔒 基础安全工具
-
-#### 第二阶段（中优先级）- 功能扩展
-- 📋 OCR文字识别优化
-- 📋 高级文件搜索
-- 📋 音频控制工具
-- 📋 网络诊断工具
-- 📋 Excel操作支持
-
-#### 第三阶段（低优先级）- 高级功能
-- 📋 图像处理工具
-- 📋 任务调度系统
-- 📋 数据库操作支持
-- 📋 宏录制与回放
-
-## 🔧 配置
-
-### 日志配置
-
-项目使用 Serilog 进行日志记录，日志文件保存在 `logs/` 目录下：
-
-- 控制台输出：实时日志显示
-- 文件输出：按天滚动，保留 31 天
-- 日志级别：Debug 及以上
-
-### 环境变量
-
-| 变量名 | 描述 | 默认值 |
-|--------|------|--------|
-| `ASPNETCORE_ENVIRONMENT` | 运行环境 | `Production` |
-
-## 📝 许可证
-
-本项目基于 MIT 许可证开源。详情请参阅 [LICENSE](LICENSE) 文件。
-
-## 🔗 相关链接
-
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [.NET 文档](https://docs.microsoft.com/dotnet/)
-- [Windows API 文档](https://docs.microsoft.com/windows/win32/)
-
-## 🤝 贡献指南
-
-我们欢迎社区贡献！如果您想为项目做出贡献，请遵循以下步骤：
-
-### 开发环境设置
-
-1. **克隆仓库**
-   ```bash
-   git clone https://github.com/AIDotNet/Windows-MCP.Net.git
-   cd Windows-MCP.Net
-   ```
-
-2. **安装依赖**
-   ```bash
-   dotnet restore
-   ```
-
-3. **运行测试**
-   ```bash
-   dotnet test
-   ```
-
-4. **构建项目**
-   ```bash
-   dotnet build
-   ```
-
-### 贡献流程
-
-1. Fork 本仓库
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 创建 Pull Request
-
-### 代码规范
-
-- 遵循 C# 编码规范
-- 为新功能添加单元测试
-- 更新相关文档
-- 确保所有测试通过
-
-### 问题报告
-
-在报告问题时，请提供：
-- 操作系统版本
-- .NET 版本
-- 详细的错误信息
-- 重现步骤
-
-## 📞 支持
-
-如果您遇到问题或有建议，请：
-
-1. 查看 [Issues](https://github.com/xuzeyu91/Windows-MCP.Net/issues)
-2. 创建新的 Issue
-3. 参与讨论
-4. 查看 [Wiki](https://github.com/xuzeyu91/Windows-MCP.Net/wiki) 获取更多帮助
----
-
-**注意**: 本工具需要适当的 Windows 权限来执行桌面自动化操作。请确保在受信任的环境中使用。
-
-**免责声明**: 使用本工具进行自动化操作时，请遵守相关法律法规和软件使用协议。开发者不承担因误用工具而产生的任何责任。
+- **系统资源监控**:
