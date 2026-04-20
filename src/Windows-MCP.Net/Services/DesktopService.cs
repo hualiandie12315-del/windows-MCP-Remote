@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using System.Net.Http;
 using HtmlAgilityPack;
@@ -21,9 +22,26 @@ public class DesktopService : IDesktopService
     private readonly ILogger<DesktopService> _logger;
     private readonly HttpClient _httpClient;
 
+    // Multi-monitor DPI cache
+    private readonly Dictionary<IntPtr, (uint dpiX, uint dpiY)> _monitorDpiCache;
+    private readonly object _cacheLock;
+    private DateTime _lastCacheRefresh;
+    private const int CACHE_REFRESH_INTERVAL_MINUTES = 5;
+    private readonly UIAutomationService _uiAutomationService;
+
     // Windows API imports
     [DllImport("user32.dll")]
     private static extern bool SetCursorPos(int x, int y);
+
+    // Multi-monitor DPI detection APIs
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr hmonitor, MONITOR_DPI_TYPE dpiType, out uint dpiX, out uint dpiY);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
 
     [DllImport("user32.dll")]
     private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
@@ -185,6 +203,19 @@ public class DesktopService : IDesktopService
     private const int PROCESS_SYSTEM_DPI_AWARE = 1;
     private const int PROCESS_PER_MONITOR_DPI_AWARE = 2;
 
+    // Multi-monitor DPI detection constants
+    private const int MONITOR_DEFAULTTONEAREST = 2;
+    private const int MONITOR_DEFAULTTONULL = 0;
+    private const int MONITOR_DEFAULTTOPRIMARY = 1;
+    
+    // Monitor DPI types
+    private enum MONITOR_DPI_TYPE
+    {
+        MDT_EFFECTIVE_DPI = 0,
+        MDT_ANGULAR_DPI = 1,
+        MDT_RAW_DPI = 2
+    }
+
     // Constants for clipboard
     private const uint CF_TEXT = 1;
     private const uint CF_UNICODETEXT = 13;
@@ -295,10 +326,16 @@ public class DesktopService : IDesktopService
     /// 初始化桌面服务实例
     /// </summary>
     /// <param name="logger">日志记录器</param>
-    public DesktopService(ILogger<DesktopService> logger)
+    public DesktopService(ILogger<DesktopService> logger, UIAutomationService uiAutomationService)
     {
         _logger = logger;
         _httpClient = new HttpClient();
+        _uiAutomationService = uiAutomationService;
+        
+        // 初始化多显示器DPI缓存
+        _monitorDpiCache = new Dictionary<IntPtr, (uint dpiX, uint dpiY)>();
+        _cacheLock = new object();
+        _lastCacheRefresh = DateTime.MinValue;
         
         // 尝试设置DPI感知以正确处理高DPI屏幕
         InitializeDpiAwareness();
@@ -328,6 +365,111 @@ public class DesktopService : IDesktopService
         var className = new StringBuilder(maxLength);
         GetClassName(hWnd, className, maxLength);
         return className.ToString();
+    }
+
+    /// <summary>
+    /// 获取指定坐标点所在显示器的DPI缩放比例
+    /// </summary>
+    /// <param name="x">X坐标</param>
+    /// <param name="y">Y坐标</param>
+    /// <returns>DPI缩放比例元组(dpiX/96.0, dpiY/96.0)</returns>
+    private (double scaleX, double scaleY) GetDpiScaleForPoint(int x, int y)
+    {
+        try
+        {
+            // 检查缓存是否需要刷新
+            if (DateTime.Now - _lastCacheRefresh > TimeSpan.FromMinutes(CACHE_REFRESH_INTERVAL_MINUTES))
+            {
+                RefreshMonitorDpiCache();
+            }
+
+            var point = new POINT { X = x, Y = y };
+            var monitorHandle = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+            
+            if (monitorHandle == IntPtr.Zero)
+            {
+                _logger.LogWarning("Failed to get monitor handle for point ({X},{Y}), using default DPI", x, y);
+                return (1.0, 1.0);
+            }
+
+            lock (_cacheLock)
+            {
+                if (_monitorDpiCache.TryGetValue(monitorHandle, out var cachedDpi))
+                {
+                    return (cachedDpi.dpiX / 96.0, cachedDpi.dpiY / 96.0);
+                }
+            }
+
+            // 缓存未命中，实时获取DPI
+            var result = GetDpiForMonitor(monitorHandle, MONITOR_DPI_TYPE.MDT_EFFECTIVE_DPI, out uint dpiX, out uint dpiY);
+            if (result == 0) // S_OK
+            {
+                lock (_cacheLock)
+                {
+                    _monitorDpiCache[monitorHandle] = (dpiX, dpiY);
+                }
+                return (dpiX / 96.0, dpiY / 96.0);
+            }
+            else
+            {
+                _logger.LogWarning("Failed to get DPI for monitor handle {Handle}, using default DPI", monitorHandle);
+                return (1.0, 1.0);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error getting DPI scale for point ({X},{Y}), using default DPI", x, y);
+            return (1.0, 1.0);
+        }
+    }
+
+    /// <summary>
+    /// 刷新显示器DPI缓存
+    /// </summary>
+    private void RefreshMonitorDpiCache()
+    {
+        try
+        {
+            lock (_cacheLock)
+            {
+                _monitorDpiCache.Clear();
+                _lastCacheRefresh = DateTime.Now;
+            }
+            _logger.LogInformation("Monitor DPI cache refreshed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error refreshing monitor DPI cache");
+        }
+    }
+
+    /// <summary>
+    /// 将逻辑坐标转换为物理坐标（考虑DPI缩放）
+    /// </summary>
+    /// <param name="logicalX">逻辑X坐标</param>
+    /// <param name="logicalY">逻辑Y坐标</param>
+    /// <returns>物理坐标元组(physicalX, physicalY)</returns>
+    private (int physicalX, int physicalY) ConvertToPhysicalCoordinates(int logicalX, int logicalY)
+    {
+        try
+        {
+            // 获取当前鼠标位置所在显示器的DPI缩放比例
+            var (scaleX, scaleY) = GetDpiScaleForPoint(logicalX, logicalY);
+            
+            // 将逻辑坐标转换为物理坐标
+            int physicalX = (int)(logicalX * scaleX);
+            int physicalY = (int)(logicalY * scaleY);
+            
+            _logger.LogDebug("Converted logical coordinates ({LogicalX},{LogicalY}) to physical coordinates ({PhysicalX},{PhysicalY}) with scale ({ScaleX},{ScaleY})", 
+                logicalX, logicalY, physicalX, physicalY, scaleX, scaleY);
+            
+            return (physicalX, physicalY);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error converting coordinates ({LogicalX},{LogicalY}), using original coordinates", logicalX, logicalY);
+            return (logicalX, logicalY);
+        }
     }
 
     /// <summary>
@@ -392,11 +534,34 @@ public class DesktopService : IDesktopService
                 { "命令提示符", new[] { "cmd.exe", "cmd", "命令提示符" } },
                 { "powershell", new[] { "powershell.exe", "powershell", "PowerShell" } },
                 { "explorer", new[] { "explorer.exe", "explorer", "资源管理器" } },
-                { "资源管理器", new[] { "explorer.exe", "explorer", "资源管理器" } }
+                { "资源管理器", new[] { "explorer.exe", "explorer", "资源管理器" } },
+                { "microsoft edge", new[] { "msedge.exe", "Microsoft Edge", "edge" } },
+                { "edge", new[] { "msedge.exe", "Microsoft Edge", "microsoft edge" } },
+                { "msedge", new[] { "msedge.exe", "Microsoft Edge", "edge" } },
+                { "chrome", new[] { "chrome.exe", "Google Chrome", "chrome" } },
+                { "google chrome", new[] { "chrome.exe", "Google Chrome", "chrome" } },
+                { "firefox", new[] { "firefox.exe", "Mozilla Firefox", "firefox" } },
+                { "mozilla firefox", new[] { "firefox.exe", "Mozilla Firefox", "firefox" } },
+                { "realtek audio console", new[] { "Realtek Audio Console", "realtek", "Realtek" } }
             };
 
             // 创建超时控制
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            
+            // 特殊处理UWP应用（如Realtek Audio Console）
+            _logger.LogInformation("检查应用名称 '{Name}' 是否匹配Realtek模式", name);
+            if (name.Contains("realtek", StringComparison.OrdinalIgnoreCase) || 
+                name.Contains("Realtek Audio Console", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("RealtekSemiconductorCorp", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Realtek模式匹配到应用名称 '{Name}'，尝试UWP启动", name);
+                var uwpResult = await TryLaunchUwpApp("RealtekSemiconductorCorp.RealtekAudioControl_dt26b99r8h8gj!App", cts.Token);
+                _logger.LogInformation("UWP启动结果: {Result}", uwpResult.Response);
+                if (uwpResult.Status == 0)
+                {
+                    return uwpResult;
+                }
+            }
             
             // 尝试多种启动方式
             var launchMethods = new List<Func<CancellationToken, Task<(string Response, int Status)>>>();
@@ -710,7 +875,10 @@ public class DesktopService : IDesktopService
     {
         try
         {
-            SetCursorPos(x, y);
+            // 将逻辑坐标转换为物理坐标（考虑DPI缩放）
+            var (physicalX, physicalY) = ConvertToPhysicalCoordinates(x, y);
+            
+            SetCursorPos(physicalX, physicalY);
             await Task.Delay(100); // Small delay for cursor positioning
 
             uint downFlag, upFlag;
@@ -739,7 +907,7 @@ public class DesktopService : IDesktopService
             }
 
             var clickType = clicks == 1 ? "Single" : clicks == 2 ? "Double" : "Triple";
-            return $"{clickType} {button} clicked at ({x},{y})";
+            return $"{clickType} {button} clicked at ({x},{y}) [converted to ({physicalX},{physicalY})]";
         }
         catch (Exception ex)
         {
@@ -914,7 +1082,9 @@ public class DesktopService : IDesktopService
         {
             if (x.HasValue && y.HasValue)
             {
-                SetCursorPos(x.Value, y.Value);
+                // 将逻辑坐标转换为物理坐标（考虑DPI缩放）
+                var (physicalX, physicalY) = ConvertToPhysicalCoordinates(x.Value, y.Value);
+                SetCursorPos(physicalX, physicalY);
                 await Task.Delay(100);
             }
 
@@ -947,18 +1117,22 @@ public class DesktopService : IDesktopService
     {
         try
         {
-            SetCursorPos(fromX, fromY);
+            // 将逻辑坐标转换为物理坐标（考虑DPI缩放）
+            var (physicalFromX, physicalFromY) = ConvertToPhysicalCoordinates(fromX, fromY);
+            var (physicalToX, physicalToY) = ConvertToPhysicalCoordinates(toX, toY);
+            
+            SetCursorPos(physicalFromX, physicalFromY);
             await Task.Delay(100);
             
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
             await Task.Delay(100);
             
-            SetCursorPos(toX, toY);
+            SetCursorPos(physicalToX, physicalToY);
             await Task.Delay(500); // Drag duration
             
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
             
-            return $"Dragged from ({fromX},{fromY}) to ({toX},{toY})";
+            return $"Dragged from ({fromX},{fromY}) [converted to ({physicalFromX},{physicalFromY})] to ({toX},{toY}) [converted to ({physicalToX},{physicalToY})]";
         }
         catch (Exception ex)
         {
@@ -977,8 +1151,11 @@ public class DesktopService : IDesktopService
     {
         try
         {
-            SetCursorPos(x, y);
-            return $"Moved mouse pointer to ({x},{y})";
+            // 将逻辑坐标转换为物理坐标（考虑DPI缩放）
+            var (physicalX, physicalY) = ConvertToPhysicalCoordinates(x, y);
+            
+            SetCursorPos(physicalX, physicalY);
+            return $"Moved mouse pointer to ({x},{y}) [converted to ({physicalX},{physicalY})]";
         }
         catch (Exception ex)
         {
@@ -1530,28 +1707,213 @@ public class DesktopService : IDesktopService
     /// <summary>
     /// 在默认浏览器中打开指定的URL
     /// </summary>
-    /// <param name="url">要打开的URL，如果为空或无效则打开百度</param>
-    /// <param name="searchQuery">可选的搜索词，会拼接到百度URL后面</param>
+    /// <param name="url">要打开的URL，如果为空或无效则返回错误</param>
+    /// <param name="searchQuery">可选的搜索词，会使用Google搜索</param>
     /// <returns>操作结果消息</returns>
     public async Task<string> OpenBrowserAsync(string? url = null, string? searchQuery = null)
     {
         try
         {
-            // 如果URL为空或无效，使用默认的百度URL
+            // 清理URL：去除多余的空格和反引号
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                url = url.Trim().Trim('`', '"', '\'');
+            }
+            
+            // 如果URL为空或无效，尝试处理搜索查询
             if (string.IsNullOrWhiteSpace(url) || !IsValidHttpUrl(url))
             {
-                url = "https://www.baidu.com";
-                
-                // 如果有搜索词，拼接到百度URL后面
+                // 如果有搜索词，使用Google搜索
                 if (!string.IsNullOrWhiteSpace(searchQuery))
                 {
                     var encodedQuery = Uri.EscapeDataString(searchQuery);
-                    url = $"https://www.baidu.com/s?wd={encodedQuery}";
+                    url = $"https://www.google.com/search?q={encodedQuery}";
+                }
+                else if (!string.IsNullOrWhiteSpace(url))
+                {
+                    // 尝试对URL进行编码处理，特别是处理包含非ASCII字符的情况
+                    try
+                    {
+                        // 处理Unicode转义序列（如\u674e\u6e05\u7167）
+                        url = DecodeUnicodeEscapes(url);
+                        
+                        // 处理包含空格的URL
+                        if (url.Contains(" "))
+                        {
+                            url = url.Replace(" ", "%20");
+                        }
+                        
+                        // 如果URL仍然无效，尝试处理查询参数中的非ASCII字符
+                        if (!IsValidHttpUrl(url))
+                        {
+                            // 尝试解析URL并单独处理查询参数
+                            var schemeEnd = url.IndexOf("://");
+                            if (schemeEnd > 0)
+                            {
+                                var scheme = url.Substring(0, schemeEnd);
+                                var rest = url.Substring(schemeEnd + 3);
+                                var pathEnd = rest.IndexOfAny(new char[] { '?', '#' });
+                                
+                                if (pathEnd > 0)
+                                {
+                                    var basePath = rest.Substring(0, pathEnd);
+                                    var queryAndFragment = rest.Substring(pathEnd);
+                                    
+                                    // 对基础路径进行编码
+                                    var encodedBasePath = basePath;
+                                    if (basePath.Any(c => c > 127))
+                                    {
+                                        // 只对非ASCII字符进行编码
+                                        var parts = basePath.Split('/');
+                                        for (int i = 0; i < parts.Length; i++)
+                                        {
+                                            if (parts[i].Any(c => c > 127))
+                                            {
+                                                parts[i] = Uri.EscapeDataString(parts[i]);
+                                            }
+                                        }
+                                        encodedBasePath = string.Join("/", parts);
+                                    }
+                                    
+                                    // 处理查询参数和片段
+                                    if (queryAndFragment.StartsWith("?"))
+                                    {
+                                        var fragmentStart = queryAndFragment.IndexOf('#');
+                                        string queryPart, fragmentPart = "";
+                                        
+                                        if (fragmentStart > 0)
+                                        {
+                                            queryPart = queryAndFragment.Substring(0, fragmentStart);
+                                            fragmentPart = queryAndFragment.Substring(fragmentStart);
+                                        }
+                                        else
+                                        {
+                                            queryPart = queryAndFragment;
+                                        }
+                                        
+                                        // 对查询参数进行编码
+                                        if (queryPart.Length > 1)
+                                        {
+                                            var queryParams = queryPart.Substring(1); // 移除开头的'?'
+                                            var paramPairs = queryParams.Split('&');
+                                            var encodedParams = new List<string>();
+                                            
+                                            foreach (var param in paramPairs)
+                                            {
+                                                var eqIndex = param.IndexOf('=');
+                                                if (eqIndex > 0)
+                                                {
+                                                    var key = param.Substring(0, eqIndex);
+                                                    var value = param.Substring(eqIndex + 1);
+                                                    
+                                                    // 对键值都进行编码
+                                                    var encodedKey = key.Any(c => c > 127) ? Uri.EscapeDataString(key) : key;
+                                                    var encodedValue = value.Any(c => c > 127) ? Uri.EscapeDataString(value) : value;
+                                                    
+                                                    encodedParams.Add($"{encodedKey}={encodedValue}");
+                                                }
+                                                else
+                                                {
+                                                    // 参数没有值的情况
+                                                    var encodedParam = param.Any(c => c > 127) ? Uri.EscapeDataString(param) : param;
+                                                    encodedParams.Add(encodedParam);
+                                                }
+                                            }
+                                            
+                                            queryPart = "?" + string.Join("&", encodedParams);
+                                        }
+                                        
+                                        url = $"{scheme}://{encodedBasePath}{queryPart}{fragmentPart}";
+                                    }
+                                    else
+                                    {
+                                        url = $"{scheme}://{encodedBasePath}{queryAndFragment}";
+                                    }
+                                }
+                                else
+                                {
+                                    // 没有查询参数的情况
+                                    var parts = rest.Split('/');
+                                    for (int i = 0; i < parts.Length; i++)
+                                    {
+                                        if (parts[i].Any(c => c > 127))
+                                        {
+                                            parts[i] = Uri.EscapeDataString(parts[i]);
+                                        }
+                                    }
+                                    url = $"{scheme}://{string.Join("/", parts)}";
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error encoding URL: {Url}", url);
+                    }
+                }
+                else
+                {
+                    return "Error: URL is required and must be a valid HTTP/HTTPS URL";
                 }
             }
 
             _logger.LogInformation("Opening URL in browser: {Url}", url);
 
+            // 尝试多种启动方式
+            var methods = new List<Func<Task<bool>>>
+            {
+                // 方法1: 使用Process.Start直接启动
+                () => TryOpenBrowserDirectly(url),
+                // 方法2: 使用cmd start
+                () => TryOpenBrowserWithCmd(url),
+                // 方法3: 尝试启动Edge浏览器
+                () => TryOpenBrowserWithEdge(url)
+            };
+
+            foreach (var method in methods)
+            {
+                if (await method())
+                {
+                    return $"Successfully opened {url} in browser";
+                }
+            }
+
+            return $"Failed to open browser using all methods";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error opening browser with URL: {Url}", url);
+            return $"Failed to open browser: {ex.Message}";
+        }
+    }
+
+    private async Task<bool> TryOpenBrowserDirectly(string url)
+    {
+        try
+        {
+            _logger.LogInformation("Trying to open browser directly with URL: {Url}", url);
+            var process = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            if (process != null)
+            {
+                _logger.LogInformation("Browser process started with ID: {ProcessId}", process.Id);
+                await Task.Delay(1000);
+                return true;
+            }
+            _logger.LogWarning("Failed to start browser process - Process.Start returned null");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exception in TryOpenBrowserDirectly with URL: {Url}", url);
+            return false;
+        }
+    }
+
+    private async Task<bool> TryOpenBrowserWithCmd(string url)
+    {
+        try
+        {
+            _logger.LogInformation("Trying to open browser with cmd command for URL: {Url}", url);
             var processStartInfo = new ProcessStartInfo
             {
                 FileName = "cmd",
@@ -1561,14 +1923,76 @@ public class DesktopService : IDesktopService
             };
 
             using var process = Process.Start(processStartInfo);
-            await Task.Delay(500); // 等待浏览器启动
-
-            return $"Successfully opened {url} in default browser";
+            if (process != null)
+            {
+                _logger.LogInformation("Cmd process started with ID: {ProcessId}", process.Id);
+                await Task.Delay(1000);
+                return true;
+            }
+            _logger.LogWarning("Failed to start cmd process - Process.Start returned null");
+            return false;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error opening browser with URL: {Url}", url);
-            return $"Failed to open browser: {ex.Message}";
+            _logger.LogError(ex, "Exception in TryOpenBrowserWithCmd with URL: {Url}", url);
+            return false;
+        }
+    }
+
+    private async Task<bool> TryOpenBrowserWithEdge(string url)
+    {
+        try
+        {
+            _logger.LogInformation("Trying to open Edge browser for URL: {Url}", url);
+            var processStartInfo = new ProcessStartInfo
+            {
+                FileName = "msedge",
+                Arguments = url,
+                UseShellExecute = true
+            };
+
+            using var process = Process.Start(processStartInfo);
+            if (process != null)
+            {
+                _logger.LogInformation("Edge process started with ID: {ProcessId}", process.Id);
+                await Task.Delay(1000);
+                return true;
+            }
+            _logger.LogWarning("Failed to start Edge process - Process.Start returned null");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exception in TryOpenBrowserWithEdge with URL: {Url}", url);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 解码Unicode转义序列（如\u674e\u6e05\u7167）
+    /// </summary>
+    /// <param name="input">包含Unicode转义序列的输入字符串</param>
+    /// <returns>解码后的字符串</returns>
+    private static string DecodeUnicodeEscapes(string input)
+    {
+        if (string.IsNullOrEmpty(input))
+            return input;
+
+        try
+        {
+            // 使用正则表达式匹配Unicode转义序列
+            var regex = new Regex(@"\\u([0-9a-fA-F]{4})");
+            return regex.Replace(input, match =>
+            {
+                var hexValue = match.Groups[1].Value;
+                var charValue = (char)Convert.ToInt32(hexValue, 16);
+                return charValue.ToString();
+            });
+        }
+        catch (Exception ex)
+        {
+            // 如果解码失败，返回原始字符串
+            return input;
         }
     }
 
@@ -1593,6 +2017,19 @@ public class DesktopService : IDesktopService
         try
         {
             _logger.LogInformation("Searching for UI element with text: {Text}", text);
+            
+            // 首先尝试使用UI Automation Framework进行增强搜索
+            var uiAutomationResult = await _uiAutomationService.FindElementByTextAsync(text, partialMatch: true, caseSensitive: false);
+            var uiAutomationResponse = JsonSerializer.Deserialize<JsonElement>(uiAutomationResult);
+            
+            if (uiAutomationResponse.TryGetProperty("found", out var foundProperty) && foundProperty.GetBoolean())
+            {
+                _logger.LogInformation("Found elements using UI Automation Framework");
+                return uiAutomationResult;
+            }
+            
+            // 如果UI Automation没有找到，回退到传统的Windows API搜索
+            _logger.LogInformation("UI Automation found no elements, falling back to Windows API");
             
             var foundWindow = IntPtr.Zero;
             EnumWindows((hWnd, lParam) =>
@@ -1669,6 +2106,19 @@ public class DesktopService : IDesktopService
         {
             _logger.LogInformation("Searching for UI element with class name: {ClassName}", className);
             
+            // 首先尝试使用UI Automation Framework进行增强搜索
+            var uiAutomationResult = await _uiAutomationService.FindElementByClassNameAsync(className, exactMatch: false);
+            var uiAutomationResponse = JsonSerializer.Deserialize<JsonElement>(uiAutomationResult);
+            
+            if (uiAutomationResponse.TryGetProperty("found", out var foundProperty) && foundProperty.GetBoolean())
+            {
+                _logger.LogInformation("Found elements using UI Automation Framework");
+                return uiAutomationResult;
+            }
+            
+            // 如果UI Automation没有找到，回退到传统的Windows API搜索
+            _logger.LogInformation("UI Automation found no elements, falling back to Windows API");
+            
             var foundWindow = IntPtr.Zero;
             EnumWindows((hWnd, lParam) =>
             {
@@ -1744,6 +2194,19 @@ public class DesktopService : IDesktopService
         {
             _logger.LogInformation("Searching for UI element with automation ID: {AutomationId}", automationId);
             
+            // 首先尝试使用UI Automation Framework进行增强搜索
+            var uiAutomationResult = await _uiAutomationService.FindElementByAutomationIdAsync(automationId, exactMatch: true);
+            var uiAutomationResponse = JsonSerializer.Deserialize<JsonElement>(uiAutomationResult);
+            
+            if (uiAutomationResponse.TryGetProperty("found", out var foundProperty) && foundProperty.GetBoolean())
+            {
+                _logger.LogInformation("Found elements using UI Automation Framework");
+                return uiAutomationResult;
+            }
+            
+            // 如果UI Automation没有找到，回退到传统的Windows API搜索
+            _logger.LogInformation("UI Automation found no elements, falling back to Windows API");
+            
             // For Windows API implementation, we'll try to parse the automationId as a window handle
             if (IntPtr.TryParse(automationId, out var hWnd) && hWnd != IntPtr.Zero)
             {
@@ -1809,6 +2272,24 @@ public class DesktopService : IDesktopService
         try
         {
             _logger.LogInformation("Getting element properties at coordinates: ({X}, {Y})", x, y);
+            
+            // 首先尝试使用UI Automation Framework进行增强搜索
+            var uiAutomationResult = await _uiAutomationService.GetElementPropertiesAsync(x, y);
+            var uiAutomationResponse = JsonSerializer.Deserialize<JsonElement>(uiAutomationResult);
+            
+            if (uiAutomationResponse.TryGetProperty("found", out var foundProperty) && foundProperty.GetBoolean())
+            {
+                _logger.LogInformation("Found detailed element properties using UI Automation Framework");
+                
+                // 更新结果以包含坐标信息
+                var resultDict = JsonSerializer.Deserialize<Dictionary<string, object>>(uiAutomationResult);
+                resultDict["coordinates"] = new { x, y };
+                
+                return JsonSerializer.Serialize(resultDict);
+            }
+            
+            // 如果UI Automation没有找到，回退到传统的Windows API搜索
+            _logger.LogInformation("UI Automation found no elements, falling back to Windows API");
             
             var point = new POINT { X = x, Y = y };
             var hWnd = WindowFromPoint(point);
@@ -1890,6 +2371,39 @@ public class DesktopService : IDesktopService
             {
                 try
                 {
+                    // 首先尝试使用UI Automation Framework进行增强搜索
+                    string uiAutomationResult = null;
+                    switch (selectorType.ToLower())
+                    {
+                        case "text":
+                            uiAutomationResult = await _uiAutomationService.FindElementByTextAsync(selector, exactMatch: false);
+                            break;
+                        case "classname":
+                            uiAutomationResult = await _uiAutomationService.FindElementByClassNameAsync(selector, exactMatch: true);
+                            break;
+                        case "automationid":
+                            uiAutomationResult = await _uiAutomationService.FindElementByAutomationIdAsync(selector, exactMatch: true);
+                            break;
+                    }
+                    
+                    if (uiAutomationResult != null)
+                    {
+                        var uiAutomationResponse = JsonSerializer.Deserialize<JsonElement>(uiAutomationResult);
+                        if (uiAutomationResponse.TryGetProperty("found", out var foundProperty) && foundProperty.GetBoolean())
+                        {
+                            _logger.LogInformation("Found elements using UI Automation Framework");
+                            
+                            // 更新结果以包含等待时间信息
+                            var resultDict = JsonSerializer.Deserialize<Dictionary<string, object>>(uiAutomationResult);
+                            resultDict["waitTime"] = (int)(DateTime.Now - startTime).TotalMilliseconds;
+                            resultDict["selector"] = selector;
+                            resultDict["selectorType"] = selectorType;
+                            
+                            return JsonSerializer.Serialize(resultDict);
+                        }
+                    }
+                    
+                    // 如果UI Automation没有找到，回退到传统的Windows API搜索
                     var foundWindow = IntPtr.Zero;
                     
                     EnumWindows((hWnd, lParam) =>
@@ -1976,6 +2490,39 @@ public class DesktopService : IDesktopService
                 error = ex.Message
             };
             return JsonSerializer.Serialize(result);
+        }
+    }
+
+    /// <summary>
+    /// 尝试启动UWP应用
+    /// </summary>
+    /// <param name="appName">应用名称</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>启动结果</returns>
+    private async Task<(string Response, int Status)> TryLaunchUwpApp(string appName, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            _logger.LogInformation("尝试启动UWP应用: {AppName}", appName);
+            
+            // 使用Windows.ApplicationModel.Package API启动UWP应用
+            var result = await ExecuteCommandAsync($"start shell:AppsFolder\\{appName}");
+            
+            if (result.Status == 0)
+            {
+                _logger.LogInformation("UWP应用启动成功: {AppName}", appName);
+                return ("Successfully launched UWP app: " + appName, 0);
+            }
+            else
+            {
+                _logger.LogWarning("UWP应用启动失败: {AppName}, 错误: {Error}", appName, result.Response);
+                return ($"Failed to launch UWP app {appName}: {result.Response}", 1);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "启动UWP应用时发生异常: {AppName}", appName);
+            return ($"Error launching UWP app {appName}: {ex.Message}", 1);
         }
     }
 

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using Interface;
 using Microsoft.Extensions.Logging;
@@ -54,7 +55,10 @@ public class GetTextCoordinatesTool
                     : "Failed to get text coordinates"
             };
             
-            return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            return JsonSerializer.Serialize(result, new JsonSerializerOptions { 
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            });
         }
         catch (Exception ex)
         {
@@ -67,7 +71,10 @@ public class GetTextCoordinatesTool
                 coordinates = (object?)null,
                 message = $"Error getting text coordinates: {ex.Message}"
             };
-            return JsonSerializer.Serialize(errorResult, new JsonSerializerOptions { WriteIndented = true });
+            return JsonSerializer.Serialize(errorResult, new JsonSerializerOptions { 
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            });
         }
     }
 }
